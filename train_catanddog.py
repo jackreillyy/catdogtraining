@@ -1,3 +1,4 @@
+# train_catanddog.py
 import argparse, os
 from pathlib import Path
 from typing import Tuple
@@ -8,7 +9,6 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from torchvision.datasets import OxfordIIITPet
 
-# torchvision weights API (>=0.13). Falls back if unavailable.
 try:
     from torchvision.models import resnet18, ResNet18_Weights
     _HAS_WEIGHTS = True
@@ -26,27 +26,49 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def make_datasets(root: str, img_size: int = 224, val_split: float = 0.1, seed: int = 42):
-    """
-    Create train/val/test datasets for Oxford-IIIT Pet and GUARANTEE labels are {0=cat,1=dog}
-    by mapping at __getitem__ time. Transforms are applied ONLY in the wrapper (avoid double-transform).
-    """
-    from torch.utils.data import Dataset
+# --- helpers to make transforms robust to PIL or tensor inputs ---
+from PIL import Image
+import torchvision.transforms.functional as TF
 
+def _ensure_tensor(img: torch.Tensor | Image.Image) -> torch.Tensor:
+    """Return CHW float tensor in [0,1]. If already a tensor, convert dtype/scale if needed."""
+    if isinstance(img, torch.Tensor):
+        # If uint8 0..255, scale to float 0..1; else leave as-is
+        if img.dtype == torch.uint8:
+            return img.float() / 255.0
+        return img.float()
+    elif isinstance(img, Image.Image):
+        return TF.to_tensor(img)  # float 0..1
+    else:
+        raise TypeError(f"Unsupported image type: {type(img)}")
+
+
+class EnsureTensor(transforms.Transform):
+    def __call__(self, img):
+        return _ensure_tensor(img)
+
+
+def make_datasets(root: str, img_size: int = 224, val_split: float = 0.1, seed: int = 42
+                  ) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, torch.utils.data.Dataset]:
+    """
+    Create train/val/test datasets and GUARANTEE labels are {0=cat,1=dog}.
+    All transforms are applied in a wrapper that first ensures tensor type.
+    """
+    # Compose that works on PIL **or** tensors
     train_tf = transforms.Compose([
+        EnsureTensor(),
         transforms.RandomResizedCrop(img_size),
         transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
         transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
     ])
     eval_tf = transforms.Compose([
+        EnsureTensor(),
         transforms.Resize(256),
         transforms.CenterCrop(img_size),
-        transforms.ToTensor(),
         transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
     ])
 
-    # IMPORTANT: base datasets have transform=None; wrapper applies transforms
+    # Base datasets MUST have transform=None so only the wrapper applies transforms
     base_trainval = OxfordIIITPet(root=root, split="trainval",
                                   target_types="category", download=True, transform=None)
     base_test = OxfordIIITPet(root=root, split="test",
@@ -64,27 +86,27 @@ def make_datasets(root: str, img_size: int = 224, val_split: float = 0.1, seed: 
     for i in cat_idx:
         map37[i] = 0  # cat -> 0; default dog -> 1
 
+    # Wrapper that applies transforms and maps labels
+    from torch.utils.data import Dataset
     class SpeciesMapDataset(Dataset):
         def __init__(self, base, map37, transform=None):
             self.base = base
             self.map37 = map37
-            self.transform = transform  # None -> no transform; otherwise apply here
+            self.transform = transform
 
-        def __len__(self):
-            return len(self.base)
+        def __len__(self): return len(self.base)
 
         def __getitem__(self, idx):
-            img, label = self.base[idx]  # label is 0..36 (breed index)
+            img, breed_idx = self.base[idx]  # img may be PIL or tensor depending on upstream
             if self.transform is not None:
-                img = self.transform(img)  # apply transform ONCE here
-            label = int(self.map37[int(label)].item())  # map -> {0,1}
+                img = self.transform(img)
+            label = int(self.map37[int(breed_idx)].item())  # -> {0,1}
             return img, label
 
         @property
-        def classes(self):
-            return ["cat","dog"]
+        def classes(self): return ["cat","dog"]
 
-    # Wrap with train transforms for the full trainval, then split
+    # Wrap trainval with train transforms, then split; swap val to eval transforms
     full_train = SpeciesMapDataset(base_trainval, map37, transform=train_tf)
     val_len = int(len(full_train) * val_split)
     train_len = len(full_train) - val_len
@@ -92,13 +114,8 @@ def make_datasets(root: str, img_size: int = 224, val_split: float = 0.1, seed: 
         full_train, [train_len, val_len],
         generator=torch.Generator().manual_seed(seed)
     )
-
-    # Ensure val uses eval transforms: swap underlying dataset of the Subset
     val_ds.dataset = SpeciesMapDataset(base_trainval, map37, transform=eval_tf)
-
-    # Test set with eval transforms
     test_ds = SpeciesMapDataset(base_test, map37, transform=eval_tf)
-
     return train_ds, val_ds, test_ds
 
 
@@ -148,7 +165,7 @@ def train(args):
 
     # sanity: labels must be {0,1}
     for name, loader in [("train", train_loader), ("val", val_loader)]:
-        imgs, t = next(iter(loader))
+        _, t = next(iter(loader))
         print(f"[label-check:{name}] unique targets -> {torch.unique(t).tolist()}")
 
     model = make_model(num_classes=2, finetune=not args.freeze).to(device)
@@ -200,9 +217,9 @@ def predict(image_path: str, ckpt_path: str, img_size: int = 224):
     model.eval()
 
     tf = transforms.Compose([
+        EnsureTensor(),
         transforms.Resize(256),
         transforms.CenterCrop(img_size),
-        transforms.ToTensor(),
         transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
     ])
 
@@ -235,3 +252,4 @@ if __name__ == "__main__":
         predict(args.predict, args.ckpt, img_size=args.img_size)
     else:
         train(args)
+
