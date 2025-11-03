@@ -1,105 +1,180 @@
-#!/usr/bin/env python3
-import argparse, os, sys, time
+import argparse, os
+from pathlib import Path
+from typing import Tuple
+
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from torchvision import transforms
+from torchvision.datasets import OxfordIIITPet
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default="./data")
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--img-size", type=int, default=224)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out", type=str, default="./runs")
-    args = parser.parse_args()
+try:
+    from torchvision.models import resnet18, ResNet18_Weights
+    _HAS_WEIGHTS = True
+except Exception:
+    from torchvision.models import resnet18
+    ResNet18_Weights = None
+    _HAS_WEIGHTS = False
 
-    print("=== Environment ===")
-    print("Python:", sys.version)
-    try:
-        import torchvision
-        print("torch:", torch.__version__)
-        print("torchvision:", torchvision.__version__)
-    except Exception as e:
-        print("torch/torchvision import error:", repr(e))
-        raise
 
-    # Import your training module
-    try:
-        import train_catanddog as tcd
-    except Exception as e:
-        print("Failed to import train_catanddog.py:", repr(e))
-        print("Make sure this script sits next to train_catanddog.py or PYTHONPATH includes your repo.")
-        raise
-
-    device = tcd.get_device()
-    print(f"Device selected: {device} | CUDA available: {torch.cuda.is_available()}")
+def get_device() -> torch.device:
     if torch.cuda.is_available():
-        print("GPU name:", torch.cuda.get_device_name(0))
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
-    # Build datasets/loaders
-    print("\n=== Building datasets/loaders ===")
-    train_ds, val_ds, test_ds = tcd.make_datasets(
-        root=args.data, img_size=args.img_size, val_split=0.1, seed=args.seed
-    )
 
-    train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=max(2, (os.cpu_count() or 4)//2), pin_memory=(device.type=="cuda")
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=max(2, (os.cpu_count() or 4)//2), pin_memory=(device.type=="cuda")
-    )
+def make_datasets(root: str, img_size: int = 224, val_split: float = 0.1, seed: int = 42):
+    train_tf = transforms.Compose([
+        transforms.RandomResizedCrop(img_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
+    ])
+    eval_tf = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
+    ])
 
-    # Sanity-check labels
-    print("\n=== Label sanity check ===")
-    x_train, y_train = next(iter(train_loader))
-    x_val, y_val = next(iter(val_loader))
-    u_train = torch.unique(y_train)
-    u_val = torch.unique(y_val)
-    print("train unique targets:", u_train.tolist())
-    print("val   unique targets:", u_val.tolist())
-    bad_train = torch.any((y_train < 0) | (y_train > 1))
-    bad_val   = torch.any((y_val   < 0) | (y_val   > 1))
-    if bad_train or bad_val:
-        print("ERROR: Found targets outside {0,1}.")
-        print("Offending train uniques:", u_train.tolist(), "val uniques:", u_val.tolist())
-        raise SystemExit(1)
+    trainval = OxfordIIITPet(root=root, split="trainval",
+                             target_types="category", download=True, transform=train_tf)
+    test = OxfordIIITPet(root=root, split="test",
+                         target_types="category", download=True, transform=eval_tf)
+
+    cat_breeds = {
+        "Abyssinian","Bengal","Birman","Bombay","British_Shorthair",
+        "Egyptian_Mau","Maine_Coon","Persian","Ragdoll",
+        "Russian_Blue","Siamese","Sphynx"
+    }
+    name_to_idx = {name:i for i,name in enumerate(trainval.classes)}
+    cat_idx = {name_to_idx[n] for n in cat_breeds if n in name_to_idx}
+
+    def to_species(label: int):
+        return 0 if label in cat_idx else 1  # 0=cat, 1=dog
+
+    trainval.target_transform = to_species
+    test.target_transform = to_species
+
+    val_len = int(len(trainval) * val_split)
+    train_len = len(trainval) - val_len
+    train_ds, val_ds = random_split(
+        trainval, [train_len, val_len],
+        generator=torch.Generator().manual_seed(seed)
+    )
+    val_ds.dataset.transform = eval_tf
+    return train_ds, val_ds, test
+
+
+def make_model(num_classes = 2, finetune=True):
+    if _HAS_WEIGHTS and ResNet18_Weights is not None:
+        model = resnet18(weights=ResNet18_Weights.DEFAULT)
     else:
-        print("OK: Targets are in {0,1}.")
+        model = resnet18(pretrained=True)
+    in_feats = model.fc.in_features
+    model.fc = nn.Linear(in_feats, num_classes)
+    if finetune:
+        for p in model.parameters(): p.requires_grad = True
+    return model
 
-    # Build model and do a single train step
-    print("\n=== One-step training smoke test ===")
-    model = tcd.make_model(num_classes=2, finetune=True).to(device)
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    correct = total = loss_sum = 0
+    for imgs, targets in loader:
+        imgs, targets = imgs.to(device), targets.to(device).long()
+        logits = model(imgs)
+        loss = criterion(logits, targets)
+        loss_sum += loss.item()*imgs.size(0)
+        correct += (logits.argmax(1) == targets).sum().item()
+        total += imgs.size(0)
+    return loss_sum/total, correct/total
 
-    x_train = x_train.to(device)
-    y_train = y_train.to(device).long()
-    logits = model(x_train)
-    print("logits shape:", tuple(logits.shape))
-    assert logits.shape[1] == 2, "Model must output 2 logits for binary classification."
 
-    # Hard assert before loss (extra safety)
-    if torch.any((y_train < 0) | (y_train > 1)):
-        print("ERROR: Bad targets in batch:", torch.unique(y_train).tolist())
-        raise SystemExit(1)
+def train(args):
+    device = get_device()
+    print(f"Using device: {device}")
 
-    loss = criterion(logits, y_train)
-    print("loss:", float(loss.item()))
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
-    print("Backprop/optimizer step OK.")
+    train_ds, val_ds, test_ds = make_datasets(args.data, args.img_size, args.val_split, args.seed)
 
-    # Save a tiny smoke-test checkpoint
-    os.makedirs(args.out, exist_ok=True)
-    ckpt_path = os.path.join(args.out, "_smoketest.pt")
-    torch.save({"model": model.state_dict(), "step": 1, "loss": float(loss.item())}, ckpt_path)
-    print(f"Saved smoke-test checkpoint to: {ckpt_path}")
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    print("\n✅ Smoke test completed successfully.")
+    # label sanity check
+    for name, loader in [("train",train_loader),("val",val_loader)]:
+        u = torch.unique(next(iter(loader))[1])
+        print(f"[label-check:{name}] -> {u.tolist()}")
+
+    model = make_model(2, finetune=not args.freeze).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    crit = nn.CrossEntropyLoss()
+
+    best = 0.0
+    best_path = Path(args.out) / "best_resnet18.pt"
+    best_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for ep in range(args.epochs):
+        model.train()
+        for imgs,targets in train_loader:
+            imgs,targets = imgs.to(device), targets.to(device).long()
+            opt.zero_grad()
+            loss = crit(model(imgs),targets)
+            loss.backward()
+            opt.step()
+        val_loss, val_acc = evaluate(model,val_loader,device)
+        print(f"[val] ep{ep} loss={val_loss:.4f} acc={val_acc:.4f}")
+        sched.step()
+        if val_acc > best:
+            best = val_acc
+            torch.save({"model":model.state_dict()}, best_path)
+            print(" ✅ Best model updated!")
+
+    ckpt = torch.load(best_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    test_loss, test_acc = evaluate(model,test_loader,device)
+    print(f"[test] loss={test_loss:.4f}, acc={test_acc:.4f}")
+
+
+def predict(image, ckpt, img_size=224):
+    device = get_device()
+    model = make_model(2, finetune=False).to(device)
+    state = torch.load(ckpt, map_location=device)
+    model.load_state_dict(state["model"])
+    model.eval()
+
+    tf = transforms.Compose([
+        transforms.Resize(256), transforms.CenterCrop(img_size),
+        transforms.ToTensor(), transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225))
+    ])
+    from PIL import Image
+    img = tf(Image.open(image).convert("RGB")).unsqueeze(0).to(device)
+    probs = torch.softmax(model(img), dim=1)[0].cpu()
+    print(f"Prediction → {'dog' if probs[1]>probs[0] else 'cat'}  {probs}")
+
 
 if __name__ == "__main__":
-    # Optional: clearer CUDA error location if something goes wrong
-    os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--data", type=str, default="./data")
+    p.add_argument("--out", type=str, default="./runs")
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--img-size", type=int, default=224)
+    p.add_argument("--val-split", type=float, default=0.1)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--freeze", action="store_true")
+    p.add_argument("--predict", type=str)
+    p.add_argument("--ckpt", type=str, default="./runs/best_resnet18.pt")
+    args = p.parse_args()
+
+    if args.predict:
+        predict(args.predict, args.ckpt, args.img_size)
+    else:
+        train(args)
+
