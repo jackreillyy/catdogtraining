@@ -52,15 +52,15 @@ def make_datasets(root: str,
                              torch.utils.data.Dataset]:
     """
     Returns (train_ds, val_ds, test_ds) where labels are guaranteed {0=cat, 1=dog}.
-    Uses OxfordIIITPet with target_types="category".
+    Uses OxfordIIITPet with target_types="binary-category".
     """
     train_tf, eval_tf = build_transforms(img_size)
 
     # Base datasets (PIL loader by default). download=True is fine if internet/cache present.
     base_trainval = OxfordIIITPet(root=root, split="trainval",
-                              target_types="species", download=True, transform=train_tf)
+                              target_types="binary-category", download=True, transform=train_tf)
     base_test     = OxfordIIITPet(root=root, split="test",
-                              target_types="species", download=True, transform=eval_tf)
+                              target_types="binary-category", download=True, transform=eval_tf)
 
 
     # Split train/val
