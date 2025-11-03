@@ -58,9 +58,10 @@ def make_datasets(root: str,
 
     # Base datasets (PIL loader by default). download=True is fine if internet/cache present.
     base_trainval = OxfordIIITPet(root=root, split="trainval",
-                                  target_types="category", download=True, transform=train_tf)
+                              target_types="species", download=True, transform=train_tf)
     base_test     = OxfordIIITPet(root=root, split="test",
-                                  target_types="category", download=True, transform=eval_tf)
+                              target_types="species", download=True, transform=eval_tf)
+
 
     # Split train/val
     val_len = int(len(base_trainval) * val_split)
@@ -158,7 +159,7 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     loss_fn = nn.CrossEntropyLoss()
-    scaler = torch.cuda.amp.GradScaler() if (args.amp and device.type == "cuda") else None
+    scaler = torch.amp.GradScaler("cuda") if (args.amp and device.type == "cuda") else None
 
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
