@@ -204,7 +204,7 @@ def train(args):
             print(f"  ✅ saved best to {best_path} (acc={val_acc:.4f})")
 
     # Final test
-    ckpt = torch.load(best_path, map_location=device)
+    ckpt = torch.load(best_path, map_location=device, weights_only=True)
     model.load_state_dict(ckpt["model"])
     test_loss, test_acc = evaluate(model, test_loader, device)
     print(f"[test] loss={test_loss:.4f} acc={test_acc:.4f}")
