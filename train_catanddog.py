@@ -1,23 +1,18 @@
-# train_catanddog.py
-import argparse, os
+import argparse
+import os
 from pathlib import Path
 from typing import Tuple
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
+
 from torchvision import transforms
 from torchvision.datasets import OxfordIIITPet
-
-try:
-    from torchvision.models import resnet18, ResNet18_Weights
-    _HAS_WEIGHTS = True
-except Exception:
-    from torchvision.models import resnet18
-    ResNet18_Weights = None
-    _HAS_WEIGHTS = False
+from torchvision.models import resnet18, ResNet18_Weights
 
 
+# ---------- Device ----------
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -26,167 +21,171 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-# --- helpers to make transforms robust to PIL or tensor inputs ---
-from PIL import Image
-import torchvision.transforms.functional as TF
+# ---------- Transforms (PIL -> Tensor) ----------
+def build_transforms(img_size: int = 224):
+    mean = [0.485, 0.456, 0.406]
+    std  = [0.229, 0.224, 0.225]
 
-def _ensure_tensor(img: torch.Tensor | Image.Image) -> torch.Tensor:
-    """Return CHW float tensor in [0,1]. If already a tensor, convert dtype/scale if needed."""
-    if isinstance(img, torch.Tensor):
-        # If uint8 0..255, scale to float 0..1; else leave as-is
-        if img.dtype == torch.uint8:
-            return img.float() / 255.0
-        return img.float()
-    elif isinstance(img, Image.Image):
-        return TF.to_tensor(img)  # float 0..1
-    else:
-        raise TypeError(f"Unsupported image type: {type(img)}")
-
-
-class EnsureTensor(transforms.Transform):
-    def __call__(self, img):
-        return _ensure_tensor(img)
-
-
-def make_datasets(root: str, img_size: int = 224, val_split: float = 0.1, seed: int = 42
-                  ) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, torch.utils.data.Dataset]:
-    """
-    Create train/val/test datasets and GUARANTEE labels are {0=cat,1=dog}.
-    All transforms are applied in a wrapper that first ensures tensor type.
-    """
-    # Compose that works on PIL **or** tensors
     train_tf = transforms.Compose([
-        EnsureTensor(),
         transforms.RandomResizedCrop(img_size),
         transforms.RandomHorizontalFlip(),
-        transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
+        transforms.ToTensor(),                  # PIL -> float tensor [0,1]
+        transforms.Normalize(mean, std),
     ])
+
     eval_tf = transforms.Compose([
-        EnsureTensor(),
         transforms.Resize(256),
         transforms.CenterCrop(img_size),
-        transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
     ])
+    return train_tf, eval_tf
 
-    # Base datasets MUST have transform=None so only the wrapper applies transforms
+
+# ---------- Datasets ----------
+def make_datasets(root: str,
+                  img_size: int = 224,
+                  val_split: float = 0.1,
+                  seed: int = 42
+                  ) -> Tuple[torch.utils.data.Dataset,
+                             torch.utils.data.Dataset,
+                             torch.utils.data.Dataset]:
+    """
+    Returns (train_ds, val_ds, test_ds) where labels are guaranteed {0=cat, 1=dog}.
+    Uses OxfordIIITPet with target_types="category".
+    """
+    train_tf, eval_tf = build_transforms(img_size)
+
+    # Base datasets (PIL loader by default). download=True is fine if internet/cache present.
     base_trainval = OxfordIIITPet(root=root, split="trainval",
-                                  target_types="category", download=True, transform=None)
-    base_test = OxfordIIITPet(root=root, split="test",
-                              target_types="category", download=True, transform=None)
+                                  target_types="category", download=True, transform=train_tf)
+    base_test     = OxfordIIITPet(root=root, split="test",
+                                  target_types="category", download=True, transform=eval_tf)
 
-    # Build breed->species map (0=cat, 1=dog)
-    cat_breeds = {
-        "Abyssinian","Bengal","Birman","Bombay","British_Shorthair",
-        "Egyptian_Mau","Maine_Coon","Persian","Ragdoll",
-        "Russian_Blue","Siamese","Sphynx"
-    }
-    name_to_idx = {name:i for i,name in enumerate(base_trainval.classes)}
-    cat_idx = {name_to_idx[n] for n in cat_breeds if n in name_to_idx}
-    map37 = torch.ones(len(base_trainval.classes), dtype=torch.long)
-    for i in cat_idx:
-        map37[i] = 0  # cat -> 0; default dog -> 1
+    # Split train/val
+    val_len = int(len(base_trainval) * val_split)
+    train_len = len(base_trainval) - val_len
 
-    # Wrapper that applies transforms and maps labels
-    from torch.utils.data import Dataset
-    class SpeciesMapDataset(Dataset):
-        def __init__(self, base, map37, transform=None):
-            self.base = base
-            self.map37 = map37
-            self.transform = transform
-
-        def __len__(self): return len(self.base)
-
-        def __getitem__(self, idx):
-            img, breed_idx = self.base[idx]  # img may be PIL or tensor depending on upstream
-            if self.transform is not None:
-                img = self.transform(img)
-            label = int(self.map37[int(breed_idx)].item())  # -> {0,1}
-            return img, label
-
-        @property
-        def classes(self): return ["cat","dog"]
-
-    # Wrap trainval with train transforms, then split; swap val to eval transforms
-    full_train = SpeciesMapDataset(base_trainval, map37, transform=train_tf)
-    val_len = int(len(full_train) * val_split)
-    train_len = len(full_train) - val_len
-    train_ds, val_ds = random_split(
-        full_train, [train_len, val_len],
+    full_train, full_val = random_split(
+        base_trainval, [train_len, val_len],
         generator=torch.Generator().manual_seed(seed)
     )
-    val_ds.dataset = SpeciesMapDataset(base_trainval, map37, transform=eval_tf)
-    test_ds = SpeciesMapDataset(base_test, map37, transform=eval_tf)
-    return train_ds, val_ds, test_ds
+
+    # Ensure val uses eval transforms (swap the transform on the underlying dataset)
+    # random_split returns a Subset; we override its dataset's transform for eval
+    full_val.dataset.transform = eval_tf
+
+    # Tiny wrapper to expose classes for logging
+    class_names = ["cat", "dog"]
+    for subset in (full_train, full_val, base_test):
+        setattr(subset, "classes", class_names)
+
+    return full_train, full_val, base_test
 
 
-def make_model(num_classes: int = 2, finetune: bool = True) -> nn.Module:
-    if _HAS_WEIGHTS and ResNet18_Weights is not None:
-        model = resnet18(weights=ResNet18_Weights.DEFAULT)
+# ---------- Model ----------
+def make_model(num_classes: int = 2, pretrained: str = "none", finetune: bool = True) -> nn.Module:
+    if pretrained.lower() == "imagenet":
+        try:
+            model = resnet18(weights=ResNet18_Weights.DEFAULT)
+        except Exception as e:
+            print(f"[warn] Could not load ImageNet weights ({e}). Using random init.")
+            model = resnet18(weights=None)
     else:
-        model = resnet18(pretrained=True)
+        model = resnet18(weights=None)
+
     in_feats = model.fc.in_features
     model.fc = nn.Linear(in_feats, num_classes)
-    if finetune:
-        for p in model.parameters():
-            p.requires_grad = True
+
+    # If finetuning, leave requires_grad=True (default); if not, freeze backbone
+    if not finetune:
+        for name, p in model.named_parameters():
+            if not name.startswith("fc."):
+                p.requires_grad = False
     return model
 
 
+# ---------- Eval ----------
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
     model.eval()
-    correct, total, loss_sum = 0, 0, 0.0
-    criterion = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss()
+    total = 0
+    correct = 0
+    loss_sum = 0.0
     for imgs, targets in loader:
-        imgs, targets = imgs.to(device), targets.to(device).long()
+        imgs, targets = imgs.to(device, non_blocking=True), targets.to(device, non_blocking=True).long()
         logits = model(imgs)
-        loss = criterion(logits, targets)
+        loss = loss_fn(logits, targets)
         loss_sum += loss.item() * imgs.size(0)
-        preds = logits.argmax(1)
-        correct += (preds == targets).sum().item()
+        pred = logits.argmax(1)
+        correct += (pred == targets).sum().item()
         total += imgs.size(0)
-    return loss_sum / total, correct / total
+    return (loss_sum / max(total, 1)), (correct / max(total, 1))
 
 
+# ---------- Train ----------
 def train(args):
     device = get_device()
     print(f"Using device: {device}")
 
     train_ds, val_ds, test_ds = make_datasets(args.data, args.img_size, args.val_split, args.seed)
 
+    # DataLoaders
     pin_mem = (device.type == "cuda")
-    num_workers = max(2, (os.cpu_count() or 4) // 2)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=pin_mem)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=pin_mem)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=num_workers, pin_memory=pin_mem)
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=pin_mem,
+        persistent_workers=(args.num_workers > 0)
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=pin_mem,
+        persistent_workers=(args.num_workers > 0)
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=pin_mem,
+        persistent_workers=(args.num_workers > 0)
+    )
 
-    # sanity: labels must be {0,1}
-    for name, loader in [("train", train_loader), ("val", val_loader)]:
-        _, t = next(iter(loader))
-        print(f"[label-check:{name}] unique targets -> {torch.unique(t).tolist()}")
+    # Peek at labels (should be [0,1])
+    for name, ld in [("train", train_loader), ("val", val_loader)]:
+        _, t = next(iter(ld))
+        print(f"[label-check:{name}] unique targets -> {sorted(set(int(i) for i in t))}")
 
-    model = make_model(num_classes=2, finetune=not args.freeze).to(device)
-
-    criterion = nn.CrossEntropyLoss()
+    model = make_model(num_classes=2, pretrained=args.pretrained, finetune=not args.freeze).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    loss_fn = nn.CrossEntropyLoss()
+    scaler = torch.cuda.amp.GradScaler() if (args.amp and device.type == "cuda") else None
 
-    best_val_acc, best_path = 0.0, Path(args.out) / "best_resnet18.pt"
-    best_path.parent.mkdir(parents=True, exist_ok=True)
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    best_path = outdir / "best_resnet18.pt"
 
+    best_acc = 0.0
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = 0.0
         for step, (imgs, targets) in enumerate(train_loader, 1):
-            imgs, targets = imgs.to(device), targets.to(device).long()
-            optimizer.zero_grad()
-            logits = model(imgs)
-            loss = criterion(logits, targets)
-            loss.backward()
-            optimizer.step()
+            imgs = imgs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True).long()
+
+            optimizer.zero_grad(set_to_none=True)
+            if scaler is None:
+                logits = model(imgs)
+                loss = loss_fn(logits, targets)
+                loss.backward()
+                optimizer.step()
+            else:
+                with torch.autocast(device_type=device.type, dtype=torch.float16):
+                    logits = model(imgs)
+                    loss = loss_fn(logits, targets)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
             running += loss.item()
             if step % 50 == 0:
                 print(f"Epoch {epoch}/{args.epochs} | step {step}/{len(train_loader)} | loss {running/50:.4f}")
@@ -196,60 +195,68 @@ def train(args):
         scheduler.step()
         print(f"[val] epoch {epoch}: loss={val_loss:.4f} acc={val_acc:.4f}")
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        if val_acc >= best_acc:
+            best_acc = val_acc
             torch.save({"model": model.state_dict(),
-                        "val_acc": best_val_acc,
-                        "epoch": epoch}, best_path)
-            print(f"  ✅ saved new best to {best_path} (acc={best_val_acc:.4f})")
+                        "epoch": epoch,
+                        "val_acc": val_acc}, best_path)
+            print(f"  ✅ saved best to {best_path} (acc={val_acc:.4f})")
 
+    # Final test
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["model"])
     test_loss, test_acc = evaluate(model, test_loader, device)
     print(f"[test] loss={test_loss:.4f} acc={test_acc:.4f}")
 
 
+# ---------- Predict ----------
+@torch.no_grad()
 def predict(image_path: str, ckpt_path: str, img_size: int = 224):
     device = get_device()
-    model = make_model(num_classes=2, finetune=False).to(device)
+    model = make_model(num_classes=2, pretrained="none", finetune=False).to(device)
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state["model"])
     model.eval()
 
     tf = transforms.Compose([
-        EnsureTensor(),
         transforms.Resize(256),
         transforms.CenterCrop(img_size),
-        transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
     ])
 
     from PIL import Image
     img = tf(Image.open(image_path).convert("RGB")).unsqueeze(0).to(device)
-    with torch.no_grad():
-        logits = model(img)
-        prob = torch.softmax(logits, dim=1).squeeze().cpu()
-        idx = int(torch.argmax(prob).item())
-        label = "dog" if idx == 1 else "cat"
-        print(f"Prediction: {label}  (cat={prob[0]:.3f}, dog={prob[1]:.3f})")
+    logits = model(img)
+    prob = torch.softmax(logits, dim=1).squeeze().cpu()
+    idx = int(prob.argmax().item())
+    label = "dog" if idx == 1 else "cat"
+    print(f"Prediction: {label} (cat={prob[0]:.3f}, dog={prob[1]:.3f})")
 
 
-if __name__ == "__main__":
+# ---------- CLI ----------
+def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data", type=str, default="./data")
+    p.add_argument("--data", type=str, default="./data", help="Root folder for Oxford-IIIT Pet")
     p.add_argument("--out", type=str, default="./runs")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--img-size", type=int, default=224)
     p.add_argument("--val-split", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--pretrained", type=str, default="none", choices=["none","imagenet"])
     p.add_argument("--freeze", action="store_true", help="freeze backbone (linear probe)")
-    p.add_argument("--predict", type=str, default=None)
+    p.add_argument("--amp", action="store_true", help="mixed precision on CUDA")
+    p.add_argument("--predict", type=str, default=None, help="path to image to classify")
     p.add_argument("--ckpt", type=str, default="./runs/best_resnet18.pt")
-    args = p.parse_args()
+    return p.parse_args()
 
+
+if __name__ == "__main__":
+    args = parse_args()
     if args.predict:
         predict(args.predict, args.ckpt, img_size=args.img_size)
     else:
         train(args)
-
